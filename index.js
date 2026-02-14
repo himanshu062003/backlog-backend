@@ -19,7 +19,7 @@ const PORT = process.env.PORT || 8000;
 const MONGO_URI = process.env.MONGO_URI;
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const SUBMIT_KEY = process.env.SUBMIT_KEY;
-const IMGBB_KEY = process.env.IMGBB_API_KEY; // <-- set this in env
+const IMGBB_KEY = "316b98117a66c6d6fa4b7f98e90fb022"; // <-- set this in env
 
 if (!IMGBB_KEY) {
   console.warn("Warning: IMGBB_API_KEY not set. Image uploads will fail until set.");
