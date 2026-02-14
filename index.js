@@ -2,10 +2,10 @@
 import express from "express";
 import cors from "cors";
 import multer from "multer";
-import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import mongoose, { Schema } from "mongoose";
+import axios from "axios";
 
 // ---------- CONFIG ----------
 const __filename = fileURLToPath(import.meta.url);
@@ -15,19 +15,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Environment / keys (set in env in production)
 const PORT = process.env.PORT || 8000;
-const MONGO_URI =
-  process.env.MONGO_URI;
-
-// ADMIN key for uploading & verifying
-const ADMIN_KEY = process.env.ADMIN_KEY ;
-// SUBMIT key for submitting answers
+const MONGO_URI = process.env.MONGO_URI;
+const ADMIN_KEY = process.env.ADMIN_KEY;
 const SUBMIT_KEY = process.env.SUBMIT_KEY;
+const IMGBB_KEY = process.env.IMGBB_API_KEY; // <-- set this in env
+
+if (!IMGBB_KEY) {
+  console.warn("Warning: IMGBB_API_KEY not set. Image uploads will fail until set.");
+}
 
 // ---------- MONGOOSE MODELS ----------
 await mongoose
-  .connect(MONGO_URI, { })
+  .connect(MONGO_URI, {})
   .then(() => console.log("Connected to MongoDB"))
   .catch((err) => {
     console.error("Error connecting to MongoDB: ", err);
@@ -46,7 +46,8 @@ const AnswerSchema = new Schema({
 
 const TaskSchema = new Schema({
   text: { type: String, required: true },
-  imagePath: { type: String, default: null },
+  imagePath: { type: String, default: null },      // public image URL
+  imageDeleteUrl: { type: String, default: null }, // (optional) delete URL returned by imgbb
   createdAt: { type: Date, default: Date.now },
   status: { type: String, enum: ["pending", "done"], default: "pending" },
   doneAt: { type: Date, default: null },
@@ -55,29 +56,47 @@ const TaskSchema = new Schema({
 const Task = mongoose.model("Task", TaskSchema);
 const Answer = mongoose.model("Answer", AnswerSchema);
 
-// ---------- MULTER SETUP ----------
-const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
-  },
-});
-const upload = multer({ storage, limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB limit
-
-// serve uploads statically
-app.use("/uploads", express.static(uploadDir));
+// ---------- MULTER SETUP (memory storage) ----------
+const storage = multer.memoryStorage(); // store file in memory buffer
+const upload = multer({ storage, limits: { fileSize: 8 * 1024 * 1024 } }); // 8MB limit
 
 // ---------- HELPERS ----------
 function sameCalendarDate(d1, d2) {
   const a = new Date(d1);
   const b = new Date(d2);
-  return a.getFullYear() === b.getFullYear() &&
-         a.getMonth() === b.getMonth() &&
-         a.getDate() === b.getDate();
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+async function uploadBufferToImgBB(buffer, originalName) {
+  if (!IMGBB_KEY) throw new Error("IMGBB_API_KEY not configured");
+
+  // imgbb API accepts base64 image in `image` form field
+  const base64 = buffer.toString("base64");
+  const params = new URLSearchParams();
+  params.append("key", IMGBB_KEY);
+  params.append("image", base64);
+  // optional: provide a name
+  params.append("name", `${Date.now()}-${path.basename(originalName)}`);
+
+  const resp = await axios.post("https://api.imgbb.com/1/upload", params.toString(), {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 30_000,
+  });
+
+  // Successful response shape: resp.data.data (contains url, display_url, delete_url maybe)
+  if (resp.data && resp.data.data) {
+    return {
+      url: resp.data.data.url || resp.data.data.display_url || null,
+      deleteUrl: resp.data.data.delete_url || resp.data.data.deleteUrl || null,
+      raw: resp.data,
+    };
+  } else {
+    throw new Error("Unexpected imgbb response: " + JSON.stringify(resp.data));
+  }
 }
 
 // ---------- ROUTES ----------
@@ -85,18 +104,30 @@ function sameCalendarDate(d1, d2) {
 // Health
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
-// Create task (admin)
+// Create task (admin) -- now uploads to imgbb instead of local disk
 app.post("/api/tasks", upload.single("image"), async (req, res) => {
   try {
     const adminKey = req.headers["x-admin-key"] || req.body.adminKey;
-    if (adminKey !== ADMIN_KEY) {
-      return res.status(401).json({ error: "Invalid admin key" });
-    }
+    if (adminKey !== ADMIN_KEY) return res.status(401).json({ error: "Invalid admin key" });
+
     const { text } = req.body;
     if (!text || !text.trim()) return res.status(400).json({ error: "text required" });
 
-    const imagePath = req.file ? `/uploads/${req.file.filename}` : null;
-    const task = new Task({ text: text.trim(), imagePath });
+    let imagePath = null;
+    let imageDeleteUrl = null;
+
+    if (req.file) {
+      try {
+        const result = await uploadBufferToImgBB(req.file.buffer, req.file.originalname);
+        imagePath = result.url;
+        imageDeleteUrl = result.deleteUrl || null;
+      } catch (uploadErr) {
+        console.error("Image upload failed:", uploadErr?.message || uploadErr);
+        return res.status(500).json({ error: "Image upload failed", details: uploadErr?.message });
+      }
+    }
+
+    const task = new Task({ text: text.trim(), imagePath, imageDeleteUrl });
     await task.save();
     return res.json({ message: "Task created", task });
   } catch (err) {
@@ -105,10 +136,10 @@ app.post("/api/tasks", upload.single("image"), async (req, res) => {
   }
 });
 
-// List tasks (optionally filter by status)
+// List tasks
 app.get("/api/tasks", async (req, res) => {
   try {
-    const status = req.query.status; // pending | done | (all)
+    const status = req.query.status;
     const q = status ? { status } : {};
     const tasks = await Task.find(q).sort({ createdAt: -1 }).lean();
     return res.json(tasks);
@@ -135,9 +166,8 @@ app.get("/api/tasks/:id", async (req, res) => {
 app.post("/api/tasks/:id/answers", async (req, res) => {
   try {
     const submitKey = req.headers["x-submit-key"] || req.body.submitKey;
-    if (submitKey !== SUBMIT_KEY) {
-      return res.status(401).json({ error: "Invalid submit key" });
-    }
+    if (submitKey !== SUBMIT_KEY) return res.status(401).json({ error: "Invalid submit key" });
+
     const { text, submitter } = req.body;
     if (!text || !text.trim()) return res.status(400).json({ error: "text required" });
 
@@ -157,13 +187,12 @@ app.post("/api/tasks/:id/answers", async (req, res) => {
   }
 });
 
-// Admin verifies an answer -> marks answer verified, marks task done, calculates backlog condition
+// Admin verifies answer
 app.post("/api/answers/:id/verify", async (req, res) => {
   try {
     const adminKey = req.headers["x-admin-key"] || req.body.adminKey;
-    if (adminKey !== ADMIN_KEY) {
-      return res.status(401).json({ error: "Invalid admin key" });
-    }
+    if (adminKey !== ADMIN_KEY) return res.status(401).json({ error: "Invalid admin key" });
+
     const answer = await Answer.findById(req.params.id);
     if (!answer) return res.status(404).json({ error: "Answer not found" });
     if (answer.verified) return res.status(400).json({ error: "Already verified" });
@@ -181,7 +210,6 @@ app.post("/api/answers/:id/verify", async (req, res) => {
       await task.save();
     }
 
-    // We'll compute backlog on-the-fly in /api/backlog-count
     return res.json({ message: "Answer verified and task marked done", answer, task });
   } catch (err) {
     console.error(err);
@@ -189,7 +217,7 @@ app.post("/api/answers/:id/verify", async (req, res) => {
   }
 });
 
-// Backlog count = number of tasks that were completed the same calendar date they were created
+// Backlog count
 app.get("/api/backlog-count", async (req, res) => {
   try {
     const doneTasks = await Task.find({ status: "done" }).lean();
@@ -204,7 +232,7 @@ app.get("/api/backlog-count", async (req, res) => {
   }
 });
 
-// Optional: Admin can delete task (and its answers + image) (admin only)
+// Delete task (admin). If imagePath is remote URL, we skip local unlinking.
 app.delete("/api/tasks/:id", async (req, res) => {
   try {
     const adminKey = req.headers["x-admin-key"] || req.body.adminKey;
@@ -213,11 +241,9 @@ app.delete("/api/tasks/:id", async (req, res) => {
     const task = await Task.findById(req.params.id);
     if (!task) return res.status(404).json({ error: "Task not found" });
 
-    // delete image file if exists
-    if (task.imagePath) {
-      const imageFull = path.join(__dirname, task.imagePath.replace("/uploads/", ""));
-      try { fs.unlinkSync(imageFull); } catch (e) {}
-    }
+    // If you saved a delete URL from the image host, you can use it to remove the remote image.
+    // We saved imageDeleteUrl earlier (if imgbb provided one). If present, you could call it here.
+    // For now, skip local unlink since files are not stored locally.
 
     await Answer.deleteMany({ taskId: task._id });
     await Task.deleteOne({ _id: task._id });
@@ -229,33 +255,37 @@ app.delete("/api/tasks/:id", async (req, res) => {
   }
 });
 
-// place this in backend/index.js (replace the older /api/backlog route)
+// backlog route you had
 app.get("/api/backlog", async (req, res) => {
-    try {
-      // create date range for "today" in server local time
-      const now = new Date();
-      const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
-      const startOfTomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0, 0);
-  
-      // total pending tasks (all-time pending backlog)
-      const totalPending = await Task.countDocuments({ status: "pending" });
-  
-      // pending tasks created today
-      const todayPending = await Task.countDocuments({
-        status: "pending",
-        createdAt: { $gte: startOfToday, $lt: startOfTomorrow },
-      });
-  
-      return res.json({ todayPending, totalPending });
-    } catch (err) {
-      console.error("Error computing backlog:", err);
-      return res.status(500).json({ error: "Server error" });
-    }
-  });
-  
-  
+  try {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+    const startOfTomorrow = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + 1,
+      0,
+      0,
+      0,
+      0
+    );
+
+    const totalPending = await Task.countDocuments({ status: "pending" });
+
+    const todayPending = await Task.countDocuments({
+      status: "pending",
+      createdAt: { $gte: startOfToday, $lt: startOfTomorrow },
+    });
+
+    return res.json({ todayPending, totalPending });
+  } catch (err) {
+    console.error("Error computing backlog:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
 
 // ---------- Start ----------
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Backend is running on http://0.0.0.0:${PORT}`);
 });
+
