@@ -18,13 +18,12 @@ app.use(express.json());
 // Environment / keys (set in env in production)
 const PORT = process.env.PORT || 8000;
 const MONGO_URI =
-  process.env.MONGO_URI ||
-  "mongodb+srv://class10basti_db_user:qWsq3ASgMEjHaggg@backlog.zguvekd.mongodb.net/backlog_db?retryWrites=true&w=majority";
+  process.env.MONGO_URI;
 
 // ADMIN key for uploading & verifying
-const ADMIN_KEY = process.env.ADMIN_KEY || "himanshu";
+const ADMIN_KEY = process.env.ADMIN_KEY ;
 // SUBMIT key for submitting answers
-const SUBMIT_KEY = process.env.SUBMIT_KEY || "himanshu2";
+const SUBMIT_KEY = process.env.SUBMIT_KEY;
 
 // ---------- MONGOOSE MODELS ----------
 await mongoose
